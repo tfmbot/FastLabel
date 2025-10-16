@@ -20,7 +20,7 @@ Label faster, edit easier, and export ready-to-train YOLO files — no clutter, 
 
 ```bash
 # Install requirements
-pip install pillow ultralytics
+pip install pillow ultralytics numpy
 
 # Run the app
 python fastlabel.py
