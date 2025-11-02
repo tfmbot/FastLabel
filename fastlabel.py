@@ -1,10 +1,10 @@
-import os, math, time, traceback
+import threading, queue
+import os, math, traceback
 from typing import List, Tuple, Optional, Dict, Set
 
-# ---------- switches / layout ----------
-SHOW_STATUS_BAR = False     # Set True to show a bottom status bar again
-HEADER_STATUS_CHARS = 28    # width (characters) for top-right header status
-MAX_HISTORY = 150           # Undo/redo history depth
+SHOW_STATUS_BAR = False 
+HEADER_STATUS_CHARS = 28
+MAX_HISTORY = 200       
 
 def log_exc(where: str, ex: BaseException):
     print(f"\n[ERROR] in {where}: {type(ex).__name__} - {ex}")
@@ -12,7 +12,8 @@ def log_exc(where: str, ex: BaseException):
 # ---------- deps ----------
 from PIL import Image, ImageTk
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog, colorchooser
+from tkinter import ttk, messagebox, filedialog, simpledialog, colorchooser, font as tkfont
+import tkinter as tk
 
 try:
     from ultralytics import YOLO
@@ -23,11 +24,12 @@ except Exception:
 # Dir names
 OUTPUT_LBL_DIR = "yoloLabels"
 
-# YOLO model ids — per your request
 YOLO_LOCKED_ID   = 0
 YOLO_UNLOCKED_ID = 1
 
-DEFAULT_YOLO_MODEL  = r""  # use Browse… to select best.pt
+FAST_NUDGE = 10
+
+DEFAULT_YOLO_MODEL  = r""  
 YOLO_CONF_THRESHOLD = 0.25
 
 LEFT_PANEL_WIDTH   = 380
@@ -35,10 +37,33 @@ IMAGE_AREA_WIDTH   = 920
 IMAGE_AREA_HEIGHT  = 920
 STATUS_MAX_CHARS   = 110
 
+ALT_MASK   = 0x0008
+CTRL_MASK  = 0x0004
+SHIFT_MASK = 0x0001
+# ---------- DUPLICATE ----------
+DUP_IOU_THRESH = 0.90 
+DUP_CENTER_PX  = 3    
+DUP_AREA_FRAC  = 0.02 
+
+SNAP_CANVAS_PX = 8           
+GRID_TARGET_STEP_CANVAS = 64 
+
 HANDLE_SIZE = 8
 MIN_SIDE    = 4
+try:
+    import torch
+    HAS_CUDA = torch.cuda.is_available()
+    if HAS_CUDA:
+        torch.backends.cudnn.benchmark = True  
+except Exception:
+    HAS_CUDA = False
 
-# Pan speed (pixels per wheel notch; smaller = slower)
+YOLO_IMG_SIZE = 640
+YOLO_BATCH    = 8       
+YOLO_MAX_DET  = 100      
+YOLO_DEVICE   = "cuda" if HAS_CUDA else "cpu"
+YOLO_HALF     = bool(HAS_CUDA)  
+
 PAN_PIXELS_PER_NOTCH = 30
 
 PALETTE = {
@@ -175,26 +200,36 @@ class LabelerApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._wrap(self.on_close))
         ensure_dirs()
         self._init_style()
-
-        # images
+        self.box_label_font = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+    
+        # ---- background workers / scan state ----
+        self._scan_thread = None
+        self._scan_queue = queue.Queue()
+        self._scan_cancel = False
+        self._scan_progress_win = None
+        self._scan_total = 0
+        self._scan_done = 0
+        self._scan_prog_var = None
+        self._scan_msg = None
+    
+        # ---- image / dataset state ----
         self.image_paths: List[str] = []
         self.image_idx: int = -1
         self.image: Optional[Image.Image] = None
-
-        # project index: per-image stats for navigator
+    
+        # per-image stats for navigator
         self.project_index: Dict[str, Dict[str, object]] = {}
-
+    
         # cached display for performance
         self._cached_disp_size: Optional[Tuple[int,int]] = None
         self._cached_photo: Optional[ImageTk.PhotoImage] = None
         self._cached_pil: Optional[Image.Image] = None
         self._image_item: Optional[int] = None
-
-        # ---
+    
+        # edits / annotations
         self.dirty = False
-        # memory
         self.annotations: Dict[str, List[Tuple[int,int,int,int,int]]] = {}
-
+    
         # view transform
         self.base_scale: float = 1.0
         self.zoom: float = 1.0
@@ -203,85 +238,140 @@ class LabelerApp(tk.Tk):
         self.offset_y: float = 0.0
         self.min_zoom: float = 0.1
         self.max_zoom: float = 16.0
-
-        # boxes
+    
+        # boxes & interaction
         self.boxes: List[Box] = []
-
-        # interaction state
         self.dragging = False
         self.shift_held = False
         self.control_held = False
-        self.alt_held = False                    # Alt = square/ratio constraint
+        self.alt_held = False
         self.drag_start: Tuple[int,int] = (0,0)
         self.rubber_id: Optional[int] = None
-
+    
         self.moving = False
         self.move_idx: Optional[int] = None
         self.move_start_img: Tuple[int,int] = (0,0)
         self.move_start_box: Optional[Tuple[int,int,int,int]] = None
-
+    
         # multi-select group move
         self.move_selected_indices: List[int] = []
         self.move_start_boxes: Dict[int, Tuple[int,int,int,int]] = {}
-
+    
         self.resizing = False
         self.resize_idx: Optional[int] = None
         self.resize_handle: Optional[str] = None
         self.resize_start_box: Optional[Tuple[int,int,int,int]] = None
-
+    
         # ctrl-drag panning
         self.panning = False
         self.pan_start_canvas: Tuple[int,int] = (0,0)
         self.pan_start_offset: Tuple[float,float] = (0.0,0.0)
-
+    
         # overlays
         self.crosshair_on = tk.BooleanVar(value=False)
+        self.show_box_labels = tk.BooleanVar(value=True)
         self.mouse_canvas_xy: Tuple[int,int] = (0,0)
         self.cursor_hidden = False
 
-        # marquee (SHIFT + drag) — initialize to avoid AttributeError
+        self.grid_on   = tk.BooleanVar(value=False)
+
+        # marquee (SHIFT + drag)
         self.marquee_selecting = False
         self.marquee_id = None
         self.marquee_start: Tuple[int, int] = (0, 0)
-
+    
         # clipboard
-        self.copied_box: Optional[object] = None   # can be tuple or list of tuples
+        self.copied_box: Optional[object] = None
         self.paste_nudge = 8
         self.paste_count = 0
-
+    
         # yolo
         self._yolo_prefilled = False
         self._prefill_running = False
         self._scan_all_running = False
         self._yolo_model_cache = {}
-
-        # classes: start EMPTY (0 labels allowed)
+    
+        # classes
         self.classes: Dict[int, Dict] = {}
-        self.var_new_cls = tk.IntVar(value=0)  # will be set when a label exists
-
-        # history (undo/redo) — stacks of snapshots
+        self.var_new_cls = tk.IntVar(value=0)
+    
+        # history
         self.undo_stack: List[Dict] = []
         self.redo_stack: List[Dict] = []
-
+    
         # context menu
         self.ctx: Optional[tk.Menu] = None
-
+    
         # ---------- layout ----------
         # Header
         header = ttk.Frame(self, style="Header.TFrame")
         header.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(header, text="Image Labeler", style="Header.TLabel").pack(side=tk.LEFT, padx=16, pady=12)
-
-        # fixed-width header status so text never changes canvas width
+    
         self.header_info = ttk.Label(
             header, text="Ready", style="HeaderInfo.TLabel",
-            width=HEADER_STATUS_CHARS, anchor="e", justify="right")
+            width=HEADER_STATUS_CHARS, anchor="e", justify="right"
+        )
         self.header_info.pack(side=tk.RIGHT, padx=16)
-
-        # Content: wrap left + right in a single row to avoid middle gaps
+    
+        self.header_center = ttk.Frame(header, style="Header.TFrame")
+        self.header_center.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    
+        self.header_toolbar = ttk.Frame(self.header_center, style="Header.TFrame")
+        self.header_toolbar.pack(pady=6)
+    
+        # Cross-hair toggle 
+        def _refresh_cross_btn():
+            on = bool(self.crosshair_on.get())
+            try:
+                self.cross_btn.configure(
+                    text="✚  Cross-hair ON" if on else "✚  Cross-hair OFF",
+                    style="ToggleOn.TButton" if on else "TButton",
+                )
+            except Exception:
+                pass
+            
+        def toggle_cross():
+            self.crosshair_on.set(not self.crosshair_on.get())
+            self._set_status(f"Cross-hair {'ON' if self.crosshair_on.get() else 'OFF'}")
+            _refresh_cross_btn()
+            self.redraw()
+    
+        self.cross_btn = ttk.Button(
+            self.header_toolbar, text="", command=self._wrap(toggle_cross)
+        )
+        self.cross_btn.pack(side=tk.LEFT, padx=(0, 8))
+        _refresh_cross_btn()
+    
+        # Keep button synced if crosshair_on changes elsewhere
+        try:
+            if getattr(self, "_cross_var_trace_id", None):
+                self.crosshair_on.trace_remove("write", self._cross_var_trace_id)
+        except Exception:
+            pass
+        self._cross_var_trace_id = self.crosshair_on.trace_add("write", lambda *_: _refresh_cross_btn())
+    
+        # Zoom controls
+        ttk.Button(
+            self.header_toolbar, text="−", style="Mini.TButton",
+            command=self._wrap(lambda: self.zoom_step(1/1.15, anchor="center"))
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            self.header_toolbar, text="Fit", style="Mini.TButton",
+            command=self._wrap(self.fit_to_screen)
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            self.header_toolbar, text="+", style="Mini.TButton",
+            command=self._wrap(lambda: self.zoom_step(1.15, anchor="center"))
+        ).pack(side=tk.LEFT)
+    
+        badge = ttk.Frame(header, style="Header.TFrame")
+        badge.pack(side=tk.RIGHT, padx=(0, 8))
+    
+        # Content area 
         content = ttk.Frame(self, style="Right.TFrame")
         content.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
+    
         # Left sidebar
         left_container = ttk.Frame(content, style="Sidebar.TFrame", width=LEFT_PANEL_WIDTH)
         left_container.pack(side=tk.LEFT, fill=tk.Y)
@@ -289,36 +379,26 @@ class LabelerApp(tk.Tk):
         left_scroll = ScrollableSidebar(left_container, width=LEFT_PANEL_WIDTH)
         left_scroll.pack(fill=tk.BOTH, expand=True)
         self.left_parent = left_scroll.inner
-
+    
         # Left cards
         self._card_images(self.left_parent)
-        self._card_project(self.left_parent)        # Project Navigator
-        self._card_view(self.left_parent)
+        self._card_project(self.left_parent)
         self._card_yolo(self.left_parent)
         self.card_visibility = self._card_visibility(self.left_parent)
         self.card_newclass  = self._card_newclass(self.left_parent)
-        self._card_class_manager(self.left_parent)  # Class Manager Pro
+        self._card_class_manager(self.left_parent)
         self._card_actions(self.left_parent)
-
-        # Right canvas area (fills remaining space)
+    
+        # Right canvas area
         right = ttk.Frame(content, style="Right.TFrame")
         right.pack(side=tk.LEFT, padx=8, pady=8, fill=tk.BOTH, expand=True)
         self.canvas = tk.Canvas(
             right, bg=PALETTE["canvasbg"], highlightthickness=1,
-            highlightbackground=PALETTE["outline2"])
+            highlightbackground=PALETTE["outline2"]
+        )
         self.canvas.pack(fill=tk.BOTH, expand=True)
-
-        # Floating zoom toolbar
-        self.toolbar = ttk.Frame(right, style="Toolbar.TFrame")
-        self.toolbar.place(x=10, y=10)
-        ttk.Button(self.toolbar, text="−", style="Mini.TButton",
-                   command=self._wrap(lambda: self.zoom_step(1/1.15, anchor="center"))).pack(side=tk.LEFT, padx=(0,4))
-        ttk.Button(self.toolbar, text="Fit", style="Mini.TButton",
-                   command=self._wrap(self.fit_to_screen)).pack(side=tk.LEFT, padx=(0,4))
-        ttk.Button(self.toolbar, text="+", style="Mini.TButton",
-                   command=self._wrap(lambda: self.zoom_step(1.15, anchor="center"))).pack(side=tk.LEFT)
-
-        # Bindings
+    
+        # ---------- bindings ----------
         self.canvas.bind("<ButtonPress-1>",   self._wrap(self.on_press))
         self.canvas.bind("<B1-Motion>",       self._wrap(self.on_drag))
         self.canvas.bind("<ButtonRelease-1>", self._wrap(self.on_release))
@@ -326,25 +406,30 @@ class LabelerApp(tk.Tk):
         self.canvas.bind("<Motion>",          self._wrap(self.on_mouse_move))
         self.canvas.bind("<Enter>",           self._wrap(self.on_canvas_enter))
         self.canvas.bind("<Leave>",           self._wrap(self.on_canvas_leave))
+        self.bind("<Control-a>", self._wrap(self.select_all_visible))
+        self.bind("<Control-A>", self._wrap(self.select_all_visible))
+        self.bind("g", self._wrap(lambda e: self._toggle_grid()))
+        self.bind("G", self._wrap(lambda e: self._toggle_grid()))
 
         # Modifiers
         for k in ("<KeyPress-Control_L>", "<KeyPress-Control_R>"):
-            self.bind(k, self._wrap(self.on_ctrl_down))
+            self.bind_all(k, self._wrap(self.on_ctrl_down))
         for k in ("<KeyRelease-Control_L>", "<KeyRelease-Control_R>"):
-            self.bind(k, self._wrap(self.on_ctrl_up))
+            self.bind_all(k, self._wrap(self.on_ctrl_up))
 
         for k in ("<KeyPress-Shift_L>", "<KeyPress-Shift_R>"):
-            self.bind(k, self._wrap(self.on_shift_down))
+            self.bind_all(k, self._wrap(self.on_shift_down))
         for k in ("<KeyRelease-Shift_L>", "<KeyRelease-Shift_R>"):
-            self.bind(k, self._wrap(self.on_shift_up))
+            self.bind_all(k, self._wrap(self.on_shift_up))
 
-        # ✅ Alt only (cross-platform). Do NOT bind Option_* — that crashes on Windows.
         for k in ("<KeyPress-Alt_L>", "<KeyPress-Alt_R>"):
-            self.bind(k, self._wrap(self.on_alt_down))
+            self.bind_all(k, self._wrap(self.on_alt_down))    
         for k in ("<KeyRelease-Alt_L>", "<KeyRelease-Alt_R>"):
-            self.bind(k, self._wrap(self.on_alt_up))
+            self.bind_all(k, self._wrap(self.on_alt_up)) 
+
 
         # Shortcuts
+        self.bind_all("<FocusOut>", self._wrap(lambda e: self._reset_modifiers()))
         self.bind("<Delete>", self._wrap(self.on_delete_selected))
         self.bind("<KeyPress-Left>",  self._wrap(lambda e: self.nudge_selected(-1, 0)))
         self.bind("<KeyPress-Right>", self._wrap(lambda e: self.nudge_selected( 1, 0)))
@@ -356,33 +441,31 @@ class LabelerApp(tk.Tk):
         self.bind("<Control-V>", self._wrap(lambda e: self.paste_copied()))
         self.bind("<Control-s>", self._wrap(lambda e: self.on_save()))
         self.bind("<Control-S>", self._wrap(lambda e: self.on_save()))
-        # Undo / Redo
         self.bind("<Control-z>", self._wrap(lambda e: self.on_undo()))
         self.bind("<Control-Z>", self._wrap(lambda e: self.on_undo()))
         self.bind("<Control-y>", self._wrap(lambda e: self.on_redo()))
         self.bind("<Control-Y>", self._wrap(lambda e: self.on_redo()))
         self.bind("<Control-Shift-Z>", self._wrap(lambda e: self.on_redo()))
-        # Number hotkeys 1..9 -> select class by order
+        # 1..9 -> select class by order
         for d in range(1,10):
             self.bind(str(d), self._wrap(lambda e, digit=d: self._on_number_hotkey(digit)))
             self.bind(f"<KP_{d}>", self._wrap(lambda e, digit=d: self._on_number_hotkey(digit)))
-
+    
         # Zoom (Ctrl + Wheel)
-        self.canvas.bind("<Control-MouseWheel>", self._wrap(self.on_ctrl_wheel))                # Windows/macOS
+        self.canvas.bind("<Control-MouseWheel>", self._wrap(self.on_ctrl_wheel))  # Windows/macOS
         self.canvas.bind("<Control-Button-4>",   self._wrap(lambda e: self.on_ctrl_wheel_linux(e, +1)))  # Linux up
         self.canvas.bind("<Control-Button-5>",   self._wrap(lambda e: self.on_ctrl_wheel_linux(e, -1)))  # Linux down
-
-        # PAN via wheel / two-finger (vertical) and Shift+wheel (horizontal)
-        self.canvas.bind("<MouseWheel>",          self._wrap(self.on_pan_wheel))               # vertical pan
-        self.canvas.bind("<Shift-MouseWheel>",    self._wrap(self.on_pan_wheel_h))             # horizontal pan (Win/macOS)
-        # Linux vertical pan:
+    
+       
+        self.canvas.bind("<MouseWheel>",          self._wrap(self.on_pan_wheel))
+        self.canvas.bind("<Shift-MouseWheel>",    self._wrap(self.on_pan_wheel_h))
         self.canvas.bind("<Button-4>",            self._wrap(lambda e: self.on_pan_wheel_linux(e, +1)))
         self.canvas.bind("<Button-5>",            self._wrap(lambda e: self.on_pan_wheel_linux(e, -1)))
-        # Linux horizontal pan via Shift+Button-4/5:
         self.canvas.bind("<Shift-Button-4>",      self._wrap(lambda e: self.on_pan_wheel_linux_h(e, +1)))
         self.canvas.bind("<Shift-Button-5>",      self._wrap(lambda e: self.on_pan_wheel_linux_h(e, -1)))
-
+    
         self._rebuild_context_menu()
+    
 
         # Status bar (optional)
         self.status = tk.StringVar(value="Ready")
@@ -391,9 +474,462 @@ class LabelerApp(tk.Tk):
             sb.pack(side=tk.BOTTOM, fill=tk.X)
             ttk.Label(sb, textvariable=self.status, style="Status.TLabel").pack(side=tk.LEFT, padx=12, pady=6)
 
+
+    def _draw_grid_(self):
+        self.canvas.delete("grid")
+
+        if self.image is None:
+            return
+
+        x0, y0, x1, y1 = self._image_rect_canvas()
+        iw, ih = self.image.size
+
+        # --- GRID ---
+        if self.grid_on.get():
+            step_img = self._nice_step(GRID_TARGET_STEP_CANVAS)
+            # verticals
+            k = 0
+            while True:
+                x_img = k * step_img
+                if x_img > iw: break
+                xc, _ = self.img_to_canvas(x_img, 0)
+                if x0 <= xc <= x1:
+                    self.canvas.create_line(xc, y0, xc, y1, fill=PALETTE["outline2"],
+                                            tags=("grid",), width=1)
+                k += 1
+            # horizontals
+            k = 0
+            while True:
+                y_img = k * step_img
+                if y_img > ih: break
+                _, yc = self.img_to_canvas(0, y_img)
+                if y0 <= yc <= y1:
+                    self.canvas.create_line(x0, yc, x1, yc, fill=PALETTE["outline2"],
+                                            tags=("grid",), width=1)
+                k += 1
+
+    def _nice_step(self, target_canvas_px: int) -> int:
+        """Return a 'nice' image-pixel step so grid lines land ~target_canvas_px apart."""
+        if self.image is None or self.scale <= 0:
+            return 50
+        target_img = max(1, int(round(target_canvas_px / self.scale)))
+        # round to 1/2/5 × 10^n
+        base = 1
+        while base * 5 < target_img:
+            base *= 10
+        candidates = [base, base*2, base*5, base*10]
+        return min(candidates, key=lambda s: abs(s - target_img))
+    def _image_rect_canvas(self):
+        """Canvas rect that the image occupies."""
+        if self.image is None:
+            return (0,0,0,0)
+        iw, ih = self.image.size
+        x0, y0 = int(self.offset_x), int(self.offset_y)
+        x1, y1 = x0 + int(iw * self.scale), y0 + int(ih * self.scale)
+        return (x0, y0, x1, y1)
+
+    def _build_snap_targets_canvas(self, skip_indices: set[int] | None = None):
+        """Collect candidate X/Y positions (canvas px) to snap to."""
+        xs, ys = set(), set()
+        x0, y0, x1, y1 = self._image_rect_canvas()
+        # image edges
+        xs.update([x0, x1]); ys.update([y0, y1])
+
+        # other visible boxes
+        for i, b in enumerate(self.boxes):
+            if skip_indices and i in skip_indices:
+                continue
+            if b.cls in self.classes and self.classes[b.cls]["show"].get():
+                bx1, by1 = self.img_to_canvas(b.x1, b.y1)
+                bx2, by2 = self.img_to_canvas(b.x2, b.y2)
+                xs.update([bx1, bx2]); ys.update([by1, by2])
+        return sorted(xs), sorted(ys)
+
+    def _snap_scalar(self, value: int, candidates: list[int]) -> tuple[int, bool]:
+        """Snap 1D scalar 'value' to nearest candidate within SNAP_CANVAS_PX."""
+        if not candidates:
+            return value, False
+        best = min(candidates, key=lambda c: abs(c - value))
+        if abs(best - value) <= SNAP_CANVAS_PX:
+            return best, True
+        return value, False
+
+    def _clear_snap_hints(self):
+        try: self.canvas.delete("snap")
+        except Exception: pass
+
+    def _draw_snap_hints(self, x_snap: int | None, y_snap: int | None):
+        """Draw thin dashed hint lines at snapped X and/or Y."""
+        x0, y0, x1, y1 = self._image_rect_canvas()
+        if x_snap is not None:
+            self.canvas.create_line(x_snap, y0, x_snap, y1, fill=PALETTE["accent"],
+                                    dash=(4,2), width=1, tags=("snap","overlay"))
+        if y_snap is not None:
+            self.canvas.create_line(x0, y_snap, x1, y_snap, fill=PALETTE["accent"],
+                                    dash=(4,2), width=1, tags=("snap","overlay"))
+
+    def _toggle_grid(self):
+        self.grid_on.set(not self.grid_on.get())
+        self._set_status(f"Grid {'ON' if self.grid_on.get() else 'OFF'}")
+        self.redraw()
+
+    def select_all_visible(self, event=None):
+        w = self.focus_get()
+        if w is not None:
+            wclass = str(w.winfo_class())
+            if wclass in ("Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "Combobox", "TCombobox"):
+                return  
+
+        if self.image is None or not self.boxes:
+            self._set_status("Select all: no boxes.")
+            return "break"
+
+        count = 0
+        for b in self.boxes:
+            visible = (b.cls in self.classes) and self.classes[b.cls]["show"].get()
+            b.selected = bool(visible)
+            if visible:
+                count += 1
+
+        self.redraw()
+        self._set_status(f"Selected {count} visible box(es).")
+        return "break"  # consume so nothing else handles it
+    def _area(self, b): 
+        return max(0, (b.x2 - b.x1) * (b.y2 - b.y1))
+
+    def _iou_boxes(self, a, b):
+        ix = max(0, min(a.x2, b.x2) - max(a.x1, b.x1))
+        iy = max(0, min(a.y2, b.y2) - max(a.y1, b.y1))
+        inter = ix * iy
+        if inter <= 0:
+            return 0.0
+        uni = self._area(a) + self._area(b) - inter
+        return inter / uni if uni > 0 else 0.0
+
+    def _near_center(self, a, b):
+        acx = (a.x1 + a.x2) / 2.0; acy = (a.y1 + a.y2) / 2.0
+        bcx = (b.x1 + b.x2) / 2.0; bcy = (b.y1 + b.y2) / 2.0
+        return abs(acx - bcx) <= DUP_CENTER_PX and abs(acy - bcy) <= DUP_CENTER_PX
+
+    def _area_close(self, a, b):
+        aa, bb = self._area(a), self._area(b)
+        if aa == 0 or bb == 0:
+            return False
+        return abs(aa - bb) / max(aa, bb) <= DUP_AREA_FRAC
+
+    def _box_visible(self, b):
+        return (b.cls in self.classes) and self.classes[b.cls]["show"].get()
+
+    def _find_duplicate_box_pairs(self):
+        """Return list of (i, j) pairs that look like duplicates (same class)."""
+        pairs = []
+        n = len(self.boxes)
+        for i in range(n):
+            bi = self.boxes[i]
+            if not self._box_visible(bi): 
+                continue
+            for j in range(i + 1, n):
+                bj = self.boxes[j]
+                if not self._box_visible(bj): 
+                    continue
+                if bi.cls != bj.cls:
+                    continue
+                iou = self._iou_boxes(bi, bj)
+                if iou >= DUP_IOU_THRESH or (self._near_center(bi, bj) and self._area_close(bi, bj)):
+                    pairs.append((i, j))
+        return pairs
+
+    def _hex_to_rgb(self, hx: str):
+        hx = (hx or "#000000").lstrip("#")
+        if len(hx) == 3: hx = "".join(c*2 for c in hx)
+        try:
+            return int(hx[0:2],16), int(hx[2:4],16), int(hx[4:6],16)
+        except Exception:
+            return (0,0,0)
+    def _reset_modifiers(self):
+        self.alt_held = False
+        self.shift_held = False
+        self.control_held = False
+
+    def _alt_active(self, event=None) -> bool:
+        """True if Alt is actually down RIGHT NOW."""
+        try:
+            if event is not None and hasattr(event, "state"):
+                if (event.state & ALT_MASK) != 0:
+                    return True
+        except Exception:
+            pass
+        return bool(self.alt_held)
+
+    def _show_scan_progress(self, total: int):
+        win = tk.Toplevel(self)
+        win.title("Scanning…")
+        win.configure(bg=PALETTE["card"])
+        win.resizable(False, False)
+        win.transient(self)  # <- not 'topmost'; just behaves like a normal dialog
+
+        frm = ttk.Frame(win, style="Dialog.TFrame", padding=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="Running YOLO on images…", style="DialogHeading.TLabel").pack(anchor="w")
+        self._scan_prog_var = tk.DoubleVar(value=0.0)
+        pb = ttk.Progressbar(frm, maximum=max(1,total), variable=self._scan_prog_var, length=320, mode="determinate")
+        pb.pack(fill=tk.X, pady=(8,4))
+
+        self._scan_msg = tk.StringVar(value="Starting…")
+        ttk.Label(frm, textvariable=self._scan_msg, style="DialogText.TLabel").pack(anchor="w")
+
+        btns = ttk.Frame(frm, style="Dialog.TFrame")
+        btns.pack(fill=tk.X, pady=(10,0))
+        def _cancel():
+            self._scan_cancel = True
+            try: self._scan_msg.set("Cancelling… (finishing current image)")
+            except Exception: pass
+            self._set_status("Scan All: cancelling…")
+        ttk.Button(btns, text="Cancel", command=_cancel).pack(side=tk.RIGHT)
+
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = self.winfo_rootx() + (self.winfo_width() - w)//2
+        y = self.winfo_rooty() + (self.winfo_height() - h)//2
+        win.geometry(f"+{max(0,x)}+{max(0,y)}")
+
+        self._scan_progress_win = win
+
+
+    def _close_scan_progress(self):
+        try:
+            if self._scan_progress_win is not None:
+                self._scan_progress_win.destroy()
+        except Exception:
+            pass
+        self._scan_progress_win = None
+        self._scan_prog_var = None
+        self._scan_msg = None
+    def _scan_all_worker(self, paths, model_path):
+        try:
+            model = self._get_yolo_model(model_path)
+        except Exception as ex:
+            self._scan_queue.put(("error", f"Model load failed: {ex}"))
+            return
+
+        total = len(paths)
+        self._scan_queue.put(("start", total))
+        processed = 0
+        failed = 0
+        total_boxes = 0
+
+        curp = self.image_paths[self.image_idx] if (self.image_paths and 0 <= self.image_idx < len(self.image_paths)) else None
+        names_map_for_current = {}
+
+        # process in batches
+        B = max(1, YOLO_BATCH)
+        for start in range(0, total, B):
+            if self._scan_cancel:
+                break
+            batch_paths = paths[start:start+B]
+
+            try:
+                # Load a small batch of images
+                pil_images = []
+                for p in batch_paths:
+                    try:
+                        pil_images.append(Image.open(p).convert("RGB"))
+                    except Exception as ex:
+                        failed += 1
+                        self._scan_queue.put(("warn", f"{os.path.basename(p)}: {ex}"))
+                        pil_images.append(None)
+
+                # Filter out Nones but keep index map
+                valid_pairs = [(p, im) for p, im in zip(batch_paths, pil_images) if im is not None]
+                if not valid_pairs:
+                    continue
+
+                v_paths, v_images = zip(*valid_pairs)
+
+                # YOLO once for the batch
+                outputs = self._detect_boxes_for_batch(list(v_images), model)
+
+                # Iterate results per image
+                for p, (boxes, names_map) in zip(v_paths, outputs):
+                    try:
+                        snap = [(b.x1, b.y1, b.x2, b.y2, b.cls) for b in boxes]
+                        self._write_yolo_txt_for_path(p, boxes)   # file I/O in worker
+                        processed += 1
+                        total_boxes += len(boxes)
+                        if p == curp:
+                            names_map_for_current = names_map
+                        # push one UI update per image
+                        self._scan_queue.put(("image", p, len(boxes), set(b.cls for b in boxes), snap))
+                    except Exception as ex:
+                        failed += 1
+                        self._scan_queue.put(("warn", f"{os.path.basename(p)}: {ex}"))
+
+            except BaseException as ex:
+                failed += len(batch_paths)
+                self._scan_queue.put(("warn", f"Batch {start//B+1}: {ex}"))
+
+        self._scan_queue.put(("done", processed, total_boxes, failed, names_map_for_current))
+
+
+    def _poll_scan_queue(self):
+        processed_one_image = False
+        try:
+            # Drain control/meta messages immediately; stop after 1 image to show 1-by-1 progress.
+            while True:
+                msg = self._scan_queue.get_nowait()
+                kind = msg[0]
+
+                if kind == "start":
+                    _, total = msg
+                    self._scan_total = total
+                    self._scan_done = 0
+                    self._show_scan_progress(total)
+                    self._set_status(f"Scan All: 0/{total}")
+
+                elif kind == "image":
+                    # Handle exactly ONE image per tick for smooth 1/400, 2/400, ...
+                    _, p, cnt, classes_set, snap = msg
+                    self._scan_done += 1
+                    if self._scan_prog_var is not None:
+                        self._scan_prog_var.set(self._scan_done)
+                    if self._scan_msg is not None:
+                        self._scan_msg.set(f"{self._scan_done}/{self._scan_total}  {os.path.basename(p)} — boxes: {cnt}")
+                    self._set_status(f"Scan All: {self._scan_done}/{self._scan_total} {os.path.basename(p)}")
+
+                    # update in-memory annotations and project index (Tk-safe)
+                    self.annotations[p] = snap
+                    self.project_index[p] = {"boxes": cnt, "classes": classes_set}
+                    if hasattr(self, "tree") and self.tree.exists(p):
+                        try: self.tree.item(p, values=(cnt,))
+                        except Exception: pass
+                    processed_one_image = True
+                    break  # <- stop here so next tick shows the next "+1"
+
+                elif kind == "warn":
+                    _, txt = msg
+                    self._set_status(f"Scan warning: {txt}")
+
+                elif kind == "error":
+                    _, txt = msg
+                    self._scan_all_running = False
+                    self._close_scan_progress()
+                    self._set_status(f"Scan failed: {txt}")
+                    try: messagebox.showerror("Scan All", txt)
+                    except Exception: pass
+                    return
+
+                elif kind == "done":
+                    _, processed, total_boxes, failed, names_map_for_current = msg
+
+                    # refresh current image if it was scanned
+                    if self.image_paths and 0 <= self.image_idx < len(self.image_paths):
+                        curp = self.image_paths[self.image_idx]
+                        if curp in self.annotations:
+                            self._push_undo()
+                            self._restore_from_snapshot(self.annotations[curp])
+                            if names_map_for_current:
+                                cls_ids = [t[4] for t in self.annotations[curp]]
+                                self._set_classes_from_detections(cls_ids, names_map_for_current)
+                            self._remember_current()
+                            self.redraw()
+
+                    self._close_scan_progress()
+                    self._scan_all_running = False
+                    msg_txt = f"Scan All done. Files: {processed}, Boxes: {total_boxes}"
+                    if failed: msg_txt += f", Failed: {failed}"
+                    self._set_status(msg_txt)
+                    try:
+                        messagebox.showinfo("Scan All", f"Completed.\nProcessed: {processed}\nBoxes total: {total_boxes}\nFailed: {failed}")
+                    except Exception:
+                        pass
+                    return
+
+        except queue.Empty:
+            pass
+        except Exception:
+            # swallow any weird queue edge case, keep polling
+            pass
+
+        # keep polling
+        if self._scan_all_running:
+            # Faster cadence right after an image to feel snappy; otherwise a bit slower.
+            self.after(15 if processed_one_image else 50, self._poll_scan_queue)
+
+
+    def _luma(self, rgb):
+        # Perceived luminance (gamma-aware)
+        r,g,b = rgb
+        def srgb_to_lin(c): 
+            c = c/255.0
+            return c**2.2
+        return 0.2126*srgb_to_lin(r) + 0.7152*srgb_to_lin(g) + 0.0722*srgb_to_lin(b)
+
+    def _best_text_color(self, bg_hex: str) -> str:
+        return "#000000" if self._luma(self._hex_to_rgb(bg_hex)) > 0.5 else "#ffffff"
+
+    def _darken_hex(self, hx: str, factor: float = 0.80) -> str:
+        r,g,b = self._hex_to_rgb(hx)
+        r = max(0, min(255, int(r*factor)))
+        g = max(0, min(255, int(g*factor)))
+        b = max(0, min(255, int(b*factor)))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_box_label(self, box, x1c: int, y1c: int):
+        """Draw a little pill with the class name above the box."""
+        info = self.classes.get(box.cls)
+        if not info: 
+            return
+        name = str(info.get("name", f"class_{box.cls}"))
+        # Measure text
+        pad_x, pad_y = 6, 2
+        text_w = self.box_label_font.measure(name)
+        text_h = self.box_label_font.metrics("linespace")
+        w = text_w + 2*pad_x
+        h = text_h + 2*pad_y
+
+        # Position: prefer just above the top-left, clamp into canvas if needed
+        cx, cy = x1c, y1c - h - 2
+        cw, ch = self.canvas_size()
+        if cy < 0:
+            cy = y1c + 2  # not enough room above; put inside the box top
+        if cx < 0: 
+            cx = 0
+        if cx + w > cw:
+            cx = max(0, cw - w - 1)
+
+        # Colors
+        base = info.get("color", "#3a3a3a")
+        bg = self._darken_hex(base, 0.82)
+        fg = self._best_text_color(bg)
+        outline = PALETTE.get("outline2", "#46586a")
+        if box.selected:
+            outline = PALETTE.get("warning", "#ffd166")
+
+        # Draw pill + text
+        self.canvas.create_rectangle(
+            cx, cy, cx + w, cy + h,
+            fill=bg, outline=outline, width=1,
+            tags=("overlay", "labelbg")
+        )
+        # Tiny shadow for readability
+        self.canvas.create_text(
+            cx + pad_x + 1, cy + pad_y + text_h//2 + 1,
+            text=name, anchor="w", fill="#000000",
+            font=self.box_label_font, tags=("overlay","labelshadow")
+        )
+        self.canvas.create_text(
+            cx + pad_x, cy + pad_y + text_h//2,
+            text=name, anchor="w", fill=fg,
+            font=self.box_label_font, tags=("overlay","label")
+        )
+
     # ---------- style ----------
     def _init_style(self):
         style = ttk.Style()
+        style.map("Treeview",
+          background=[("selected", PALETTE.get("hover", "#304156"))],
+          foreground=[("selected", "#ffffff")])
         try: style.theme_use("clam")
         except Exception: pass
         self.configure(bg=PALETTE["bg"])
@@ -503,6 +1039,72 @@ class LabelerApp(tk.Tk):
             foreground="#ff3b3b",
             font=("Segoe UI", 16, "bold")
         )
+        
+    def _make_big_toggle(self, parent, text: str, tk_boolvar: tk.BooleanVar, on_toggle):
+        """
+        A large, pill-style toggle: [● OFF] / [ON ●]
+        - Click anywhere to toggle
+        - Space/Enter when focused
+        - Tracks tk_boolvar and calls on_toggle()
+        """
+        frm = ttk.Frame(parent, style="Card.TLabelframe")
+        # Visual switch on a small Canvas
+        W, H = 64, 28
+        c = tk.Canvas(frm, width=W, height=H, bd=0, highlightthickness=0,
+                      bg=PALETTE["card"])
+        c.grid(row=0, column=0, padx=(0, 10))
+        lbl = ttk.Label(frm, text=text, style="DialogHeading.TLabel")
+        lbl.grid(row=0, column=1, sticky="w")
+
+        # Draw background + knob; store item IDs
+        radius = H // 2
+        track_id = c.create_oval(0, 0, 0, 0)  # placeholder
+        knob_id  = c.create_oval(0, 0, 0, 0)  # placeholder
+        text_id  = c.create_text(0, 0, text="", anchor="c")
+
+        def draw():
+            on = bool(tk_boolvar.get())
+            # Colors
+            track_on  = PALETTE.get("accent", "#00e6d2")
+            track_off = PALETTE.get("outline2", "#46586a")
+            knob      = "#ffffff"
+            text_col  = "#0b0f12" if on else "#ffffff"
+
+            # Track (rounded pill)
+            c.delete("all")
+            # left circle + right circle + middle rect -> a pill
+            c.create_oval(1, 1, 1 + 2*radius - 2, H - 1, fill=track_on if on else track_off,
+                          outline="", tags=("track",))
+            c.create_oval(W - (2*radius), 1, W - 1, H - 1, fill=track_on if on else track_off,
+                          outline="", tags=("track",))
+            c.create_rectangle(radius, 1, W - radius, H - 1, fill=track_on if on else track_off,
+                               outline="", tags=("track",))
+
+            # Knob
+            kx1 = W - (H - 4) - 2 if on else 2
+            kx2 = kx1 + (H - 4)
+            c.create_oval(kx1, 2, kx2, H - 2, fill=knob, outline=PALETTE.get("outline", "#3a4a5a"),
+                          width=1, tags=("knob",))
+
+            # ON/OFF text
+            c.create_text(W//2, H//2, text=("ON" if on else "OFF"),
+                          fill=text_col, font=("Segoe UI", 9, "bold"))
+
+        def toggle(_evt=None):
+            tk_boolvar.set(not tk_boolvar.get())
+            draw()
+            if callable(on_toggle):
+                on_toggle()
+
+        # Interactions
+        for w in (c, lbl, frm):
+            w.bind("<Button-1>", toggle)
+        frm.bind("<Key-Return>", toggle)
+        frm.bind("<space>", toggle)
+
+        draw()
+        return frm
+
     # ---------- UI cards ----------
     def _card_images(self, parent):
         card = ttk.Labelframe(parent, text="DATASET", style="Card.TLabelframe", padding=10)
@@ -512,7 +1114,12 @@ class LabelerApp(tk.Tk):
         row = ttk.Frame(card, style="Card.TLabelframe"); row.pack(fill=tk.X, pady=(8,0))
         ttk.Button(row, text="⟨  Prev", command=self._wrap(self.prev_image)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(row, text="Next  ⟩", command=self._wrap(self.next_image)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        self.lbl_counts = ttk.Label(card, text="File: —\nBoxes: 0 (Visible: 0)", style="Muted.TLabel", justify="left")
+        self.lbl_counts = ttk.Label(
+            card,
+            text="File: —\nImage: 0/0\nBoxes: 0 (Visible: 0)",
+            style="Muted.TLabel",
+            justify="left"
+        )
         self.lbl_counts.pack(anchor="w", pady=(8,0))
 
     def _card_project(self, parent):
@@ -548,6 +1155,9 @@ class LabelerApp(tk.Tk):
             selectmode="browse",
             height=8
         )
+        self.tree.tag_configure("current_row",
+                        background=PALETTE.get("hover", "#304156"),
+                        foreground=PALETTE.get("fg", "#ffffff"))
         self.tree.heading("#0", text="File")
         self.tree.heading("boxes", text="Boxes")
         self.tree.column("#0", stretch=True, width=220)
@@ -575,16 +1185,27 @@ class LabelerApp(tk.Tk):
 
         # "Has: Class X" filters populated dynamically
         self._update_filter_with_classes()
+    def _highlight_current_in_tree(self):
+        if not hasattr(self, "tree"):
+            return
+        # clear any previous highlight
+        for iid in self.tree.get_children(""):
+            self.tree.item(iid, tags=())
+        if not (self.image_paths and 0 <= self.image_idx < len(self.image_paths)):
+            return
+        iid = self.image_paths[self.image_idx]
+        if self.tree.exists(iid):
+            self.tree.item(iid, tags=("current_row",))
+            # also show it as selected/focused & scroll into view
+            try:
+                self.tree.selection_set(iid)
+                self.tree.focus(iid)
+                self.tree.see(iid)
+            except Exception:
+                pass
+            
 
-    def _card_view(self, parent):
-        card = ttk.Labelframe(parent, text="VIEW", style="Card.TLabelframe", padding=10)
-        card.pack(fill=tk.X, pady=6, padx=8)
-        def toggle_cross():
-            self.crosshair_on.set(self.crosshair_on.get() if False else not self.crosshair_on.get())
-            self._set_status(f"Cross-hair {'ON' if self.crosshair_on.get() else 'OFF'}")
-            self.redraw()
-        self.cross_btn = ttk.Button(card, text="✚  Cross-hair OFF", command=self._wrap(toggle_cross))
-        self.cross_btn.pack(fill=tk.X)
+    
     def _tree_on_mousewheel(self, e):
         """
         Scroll the PROJECT tree when hovered, but only if it can scroll further.
@@ -620,7 +1241,7 @@ class LabelerApp(tk.Tk):
                 return "break"
         except Exception:
             pass
-
+    
     def _card_yolo(self, parent):
         card = ttk.Labelframe(parent, text="YOLO PREFILL", style="Card.TLabelframe", padding=10)
         card.pack(fill=tk.X, pady=6, padx=8)
@@ -643,11 +1264,89 @@ class LabelerApp(tk.Tk):
     def _card_visibility(self, parent):
         card = ttk.Labelframe(parent, text="VISIBILITY", style="Card.TLabelframe", padding=10)
         card.pack(fill=tk.X, pady=6, padx=8)
+    
+        header = ttk.Frame(card, style="Card.TLabelframe")
+        header.pack(fill=tk.X, pady=(0, 10))
+    
+        # 👇 PACK THE RETURNED WIDGET
+        self._make_big_toggle(
+            header,
+            text="Show class labels on boxes",
+            tk_boolvar=self.show_box_labels,
+            on_toggle=self.redraw
+        ).pack(anchor="w")   # <- without this, it won't appear
+    
         self.visibility_container = ttk.Frame(card, style="Card.TLabelframe")
         self.visibility_container.pack(fill=tk.X)
         self._rebuild_visibility_ui()
         return card
+    
 
+
+    def _import_labels_from_file(self):
+        path = filedialog.askopenfilename(
+            title="Select labels text file",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+    
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                raw_lines = f.readlines()
+        except Exception as ex:
+            messagebox.showerror("Import failed", f"Could not read file:\n{path}\n\n{ex}")
+            return
+    
+        # Normalize & filter lines
+        labels_in = []
+        for line in raw_lines:
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("#"):   # allow comments
+                continue
+            labels_in.append(s)
+    
+        if not labels_in:
+            messagebox.showinfo("Import labels", "No labels found in the file.")
+            return
+    
+        existing_lower = {info["name"].lower() for info in self.classes.values()}
+        added = 0
+        skipped = 0
+    
+        # Snapshot for undo
+        self._push_undo()
+    
+        for name in labels_in:
+            if name.lower() in existing_lower:
+                skipped += 1
+                continue
+            cid = self._next_free_id()
+            self.classes[cid] = {
+                "name": name,
+                "color": self._auto_color_for(cid),
+                "show": tk.BooleanVar(value=True)
+            }
+            existing_lower.add(name.lower())
+            added += 1
+    
+        # Refresh UI
+        self._rebuild_visibility_ui()
+        self._rebuild_newclass_ui()
+        self.redraw()
+    
+        # Feedback
+        self._set_status(f"Imported {added} label(s)" + (f", skipped {skipped} duplicate(s)" if skipped else ""))
+        try:
+            messagebox.showinfo(
+                "Import labels",
+                f"Imported: {added}\nSkipped duplicates: {skipped}"
+            )
+        except Exception:
+            pass
+        
     def _card_newclass(self, parent):
         card = ttk.Labelframe(parent, text="CLASSES", style="Card.TLabelframe", padding=10)
         card.pack(fill=tk.X, pady=6, padx=8)
@@ -659,7 +1358,9 @@ class LabelerApp(tk.Tk):
                    command=self._wrap(self._add_label_dialog)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(row, text="➖  Remove label…", style="Danger.TButton",
                    command=self._wrap(self._remove_label_dialog)).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-
+        row2 = ttk.Frame(card, style="Card.TLabelframe"); row2.pack(fill=tk.X, pady=(8,0))
+        ttk.Button(row2, text="📄  Import labels…",
+                   command=self._wrap(self._import_labels_from_file)).pack(side=tk.LEFT, fill=tk.X, expand=True)
         self._rebuild_newclass_ui()
         return card
 
@@ -809,6 +1510,8 @@ class LabelerApp(tk.Tk):
         self._rebuild_project_index()
         self._rebuild_project_tree()
         self._set_status("Project refreshed.")
+        self._highlight_current_in_tree()
+
 
     def _rebuild_project_index(self):
         self.project_index.clear()
@@ -850,8 +1553,9 @@ class LabelerApp(tk.Tk):
             except Exception:
                 match_cid = None
 
+        filtered = []
         for p in self.image_paths:
-            info = self.project_index.get(p, {"boxes":0,"classes":set()})
+            info = self.project_index.get(p, {"boxes": 0, "classes": set()})
             b = int(info.get("boxes", 0))
             cset = set(info.get("classes", set()))
             if flt == "Labeled" and b == 0:
@@ -860,8 +1564,13 @@ class LabelerApp(tk.Tk):
                 continue
             if match_cid is not None and match_cid not in cset:
                 continue
-            iid = p  # use full path as item id
-            self.tree.insert("", "end", iid=iid, text=os.path.basename(p), values=(b,))
+            filtered.append((p, b))
+
+        for i, (p, b) in enumerate(filtered, start=1):
+            base = os.path.basename(p)
+            self.tree.insert("", "end", iid=p, text=f"{i}. {base}", values=(b,))
+
+        self._highlight_current_in_tree()
 
     def _on_tree_double_click(self, _evt=None):
         sel = self.tree.selection()
@@ -872,6 +1581,8 @@ class LabelerApp(tk.Tk):
             self.image_idx = self.image_paths.index(path)
             self._history_reset()
             self._load_current_image()
+            self._highlight_current_in_tree()
+
 
     def _on_tree_enter(self, _evt=None):
         self._on_tree_double_click()
@@ -1124,6 +1835,9 @@ class LabelerApp(tk.Tk):
         self._rebuild_project_index()
         self._rebuild_project_tree()
         self._load_current_image()
+        self._load_current_image()
+        self._highlight_current_in_tree()
+
 
     def prev_image(self):
         if not self.image_paths: return
@@ -1136,6 +1850,9 @@ class LabelerApp(tk.Tk):
         self.image_idx -= 1
         self._history_reset()
         self._load_current_image()
+        self._load_current_image()
+        self._highlight_current_in_tree()
+
 
     def next_image(self):
         if not self.image_paths: return
@@ -1148,6 +1865,9 @@ class LabelerApp(tk.Tk):
         self.image_idx += 1
         self._history_reset()
         self._load_current_image()
+        self._load_current_image()
+        self._highlight_current_in_tree()
+
 
     def _load_current_image(self):
         self.boxes.clear()
@@ -1196,6 +1916,8 @@ class LabelerApp(tk.Tk):
         self._set_status(msg)
         self.dirty = False
         self.redraw()
+        self._highlight_current_in_tree()
+
 
     def on_close(self):
         # Only prompt if there are unsaved changes for the current image
@@ -1386,12 +2108,73 @@ class LabelerApp(tk.Tk):
         self._set_status(f"Model selected: {os.path.basename(path)}")
 
     def _get_yolo_model(self, path: str):
-        key = os.path.abspath(path)
+        key = os.path.abspath(path) + f"|{YOLO_DEVICE}|half={YOLO_HALF}"
         mdl = self._yolo_model_cache.get(key)
-        if mdl is not None: return mdl
-        mdl = YOLO(key)
+        if mdl is not None:
+            return mdl
+        from ultralytics import YOLO
+        mdl = YOLO(path)
+        try:
+            # put backbone on device; use fp16 on GPU
+            if YOLO_DEVICE == "cuda":
+                mdl.to("cuda")
+            if YOLO_HALF:
+                try: mdl.model.half()
+                except Exception: pass
+            # fuse conv+bn for speed (safe at inference)
+            try: mdl.fuse()
+            except Exception: pass
+        except Exception:
+            pass
         self._yolo_model_cache[key] = mdl
         return mdl
+    def _detect_boxes_for_batch(self, pil_images, model):
+        import numpy as np
+        # Convert PIL -> np arrays once
+        arr_list = [np.array(im) for im in pil_images]
+
+        # Call YOLO once for the whole batch
+        res = model.predict(
+            source=arr_list,
+            imgsz=YOLO_IMG_SIZE,
+            conf=YOLO_CONF_THRESHOLD,
+            max_det=YOLO_MAX_DET,
+            device=YOLO_DEVICE,
+            half=YOLO_HALF,
+            verbose=False,
+            batch=YOLO_BATCH,
+            workers=0,      # no extra loaders; we already passed arrays
+            stream=False,
+        )
+
+        names = getattr(model, "names", {}) or {}
+        out = []
+
+        for im, r in zip(pil_images, res):
+            iw, ih = im.size
+            boxes_out = []
+            if getattr(r, "boxes", None) is not None:
+                for b in r.boxes:
+                    try:
+                        cls_id = int(b.cls[0].item()) if hasattr(b, "cls") else None
+                        xyxy   = b.xyxy[0].tolist() if hasattr(b, "xyxy") else None
+                        xyxy   = self._sanitize_and_clip(xyxy, iw, ih)
+                        if cls_id is None or xyxy is None:
+                            continue
+
+                        # your special mapping
+                        nm_lower = str(names.get(cls_id, "")).lower()
+                        if cls_id not in (YOLO_UNLOCKED_ID, YOLO_LOCKED_ID):
+                            if "unlock" in nm_lower: cls_id = YOLO_UNLOCKED_ID
+                            elif "lock"  in nm_lower: cls_id = YOLO_LOCKED_ID
+
+                        x1, y1, x2, y2 = xyxy
+                        boxes_out.append(Box(x1, y1, x2, y2, cls=cls_id, selected=False))
+                    except Exception:
+                        pass
+            out.append((boxes_out, names))
+        return out
+
 
     def _sanitize_and_clip(self, xyxy, iw, ih) -> Optional[Tuple[int,int,int,int]]:
         if xyxy is None or len(xyxy) != 4: return None
@@ -1501,53 +2284,19 @@ class LabelerApp(tk.Tk):
             self._set_status("Another prefill is running…"); return
 
         self._scan_all_running = True
-        processed = 0
-        total_boxes = 0
-        failed = 0
-        names_map_for_current: Dict[int,str] = {}
-        try:
-            model = self._get_yolo_model(self.var_model.get().strip())
-            curp = self.image_paths[self.image_idx] if (self.image_paths and 0 <= self.image_idx < len(self.image_paths)) else None
-            for i, p in enumerate(self.image_paths):
-                try:
-                    fn = os.path.basename(p)
-                    self._set_status(f"Scanning {i+1}/{len(self.image_paths)}: {fn}")
-                    self.update_idletasks()
-                    im = Image.open(p).convert("RGB")
-                    boxes, names_map = self._detect_boxes_for_image(im, model)
-                    snap = [(b.x1,b.y1,b.x2,b.y2,b.cls) for b in boxes]
-                    self.annotations[p] = snap
-                    self._write_yolo_txt_for_path(p, boxes)
-                    total_boxes += len(boxes)
-                    processed += 1
-                    if curp and p == curp:
-                        names_map_for_current = names_map
-                except BaseException as ex:
-                    failed += 1
-                    log_exc("scan_all_item", ex)
+        self._scan_cancel = False
 
-            if self.image_paths and 0 <= self.image_idx < len(self.image_paths):
-                curp = self.image_paths[self.image_idx]
-                if curp in self.annotations:
-                    self._push_undo()
-                    self._restore_from_snapshot(self.annotations[curp])
-                    self._yolo_prefilled = True
-                    cls_ids = [t[4] for t in self.annotations[curp]]
-                    self._set_classes_from_detections(cls_ids, names_map_for_current)
-                    self._remember_current()
-                    self.redraw()
+        paths = list(self.image_paths)
+        model_path = self.var_model.get().strip()
 
-            self._set_status(f"Scan All done. Files: {processed}, Boxes: {total_boxes}" + (f", Failed: {failed}" if failed else ""))
-            try:
-                messagebox.showinfo("Scan All", f"Completed.\nProcessed: {processed}\nBoxes total: {total_boxes}\nFailed: {failed}")
-            except Exception:
-                pass
-        except BaseException as ex:
-            log_exc("on_scan_all", ex)
-            try: messagebox.showerror("Scan All failed", str(ex))
-            except Exception: pass
-        finally:
-            self._scan_all_running = False
+        # start worker
+        self._scan_thread = threading.Thread(
+            target=self._scan_all_worker, args=(paths, model_path), daemon=True
+        )
+        self._scan_thread.start()
+
+        self._poll_scan_queue()
+
 
     # ---------- VIEW / ZOOM / PAN ----------
     def canvas_size(self) -> Tuple[int,int]:
@@ -1677,20 +2426,27 @@ class LabelerApp(tk.Tk):
     def redraw(self):
         if self.image is None:
             self.canvas.delete("overlay")
+            self.canvas.delete("grid")
+            self.canvas.delete("snap")
             self._update_counts()
             return
-
+    
         self._compute_base_scale()
         self._clamp_offsets()
         self._ensure_image_surface()
+    
         self.canvas.delete("overlay")
-
-        # Boxes
+        self.canvas.delete("grid")
+        self.canvas.delete("snap")
+    
+        self._draw_grid_()
+    
         for idx, box in enumerate(self.boxes):
-            if box.cls not in self.classes:  # removed class
+            if box.cls not in self.classes: 
                 continue
             if not self.classes[box.cls]["show"].get():
                 continue
+            
             x1, y1 = self.img_to_canvas(box.x1, box.y1)
             x2, y2 = self.img_to_canvas(box.x2, box.y2)
             outline = self.classes[box.cls]["color"]
@@ -1698,8 +2454,41 @@ class LabelerApp(tk.Tk):
             self.canvas.create_rectangle(x1,y1,x2,y2, outline=outline, width=2,
                                          tags=(f"box-{idx}","box","overlay"))
             self.canvas.tag_bind(f"box-{idx}", "<Button-1>", lambda e, i=idx: self.select_box(i))
+            if self.show_box_labels.get():
+                self._draw_box_label(box, x1, y1)
+        # --- highlight duplicates 
+        dup_pairs = self._find_duplicate_box_pairs()
+        dup_idx = set([i for p in dup_pairs for i in p])
 
-        # Handles for selected (only when exactly one is selected and visible)
+        for idx in dup_idx:
+            b = self.boxes[idx]
+            if not self._box_visible(b):
+                continue
+            x1, y1 = self.img_to_canvas(b.x1, b.y1)
+            x2, y2 = self.img_to_canvas(b.x2, b.y2)
+
+            # dashed outer halo
+            self.canvas.create_rectangle(
+                x1 - 2, y1 - 2, x2 + 2, y2 + 2,
+                outline=PALETTE["danger"], width=1, dash=(4, 3),
+                tags=("overlay", "dup")
+            )
+            badge_h = 14
+            by = y1 - badge_h - 2
+            if by < 0:
+                by = y1 + 2
+            self.canvas.create_rectangle(
+                x1, by, x1 + 34, by + badge_h,
+                fill=PALETTE["danger"], outline=PALETTE["outline2"],
+                tags=("overlay", "dup")
+            )
+            self.canvas.create_text(
+                x1 + 4, by + badge_h // 2,
+                text="DUP", anchor="w",
+                fill="#0b0f12", font=("Segoe UI", 8, "bold"),
+                tags=("overlay", "dup")
+            )
+
         selected_count = sum(1 for b in self.boxes if b.selected)
         if selected_count == 1:
             sel_idx = self._selected_index()
@@ -1707,13 +2496,13 @@ class LabelerApp(tk.Tk):
                 b = self.boxes[sel_idx]
                 if b.cls in self.classes and self.classes[b.cls]["show"].get():
                     self._draw_handles_for(sel_idx, b)
-
-        # Overlays
+    
+        # 3) crosshair/cursor
         self._draw_crosshair()
         self._draw_cursor_plus()
-
+    
         self._update_counts()
-
+    
         try:
             if self.crosshair_on.get():
                 self.cross_btn.configure(text="✚  Cross-hair ON", style="ToggleOn.TButton")
@@ -1721,6 +2510,7 @@ class LabelerApp(tk.Tk):
                 self.cross_btn.configure(text="✚  Cross-hair OFF", style="TButton")
         except Exception:
             pass
+        
 
     def _clear_marquee(self):
         if self.marquee_id is not None:
@@ -1731,7 +2521,6 @@ class LabelerApp(tk.Tk):
             self.marquee_id = None
 
     def _update_marquee(self, event):
-        """Draw/refresh the marquee selection rectangle (canvas coords)."""
         if self.image is None:
             return
         self._clear_marquee()
@@ -1745,14 +2534,12 @@ class LabelerApp(tk.Tk):
 
     @staticmethod
     def _norm_rect(x1, y1, x2, y2):
-        """Normalize rectangle so x1<=x2, y1<=y2."""
         if x1 > x2: x1, x2 = x2, x1
         if y1 > y2: y1, y2 = y2, y1
         return x1, y1, x2, y2
 
     @staticmethod
     def _rects_intersect(a, b):
-        """Axis-aligned intersection check. a/b are (x1,y1,x2,y2) inclusive-like."""
         ax1, ay1, ax2, ay2 = a
         bx1, by1, bx2, by2 = b
         return (ax1 <= bx2 and ax2 >= bx1 and ay1 <= by2 and ay2 >= by1)
@@ -1811,9 +2598,20 @@ class LabelerApp(tk.Tk):
 
     def _update_counts(self):
         total = len(self.boxes)
-        visible = sum(1 for b in self.boxes if b.cls in self.classes and self.classes[b.cls]["show"].get())
-        fname = os.path.basename(self.image_paths[self.image_idx]) if (self.image_paths and self.image_idx>=0) else "—"
-        self.lbl_counts.config(text=f"File: {fname}\nBoxes: {total} (Visible: {visible})")
+        visible = sum(1 for b in self.boxes
+                      if b.cls in self.classes and self.classes[b.cls]["show"].get())
+
+        # File name
+        fname = os.path.basename(self.image_paths[self.image_idx]) \
+                if (self.image_paths and 0 <= self.image_idx < len(self.image_paths)) else "—"
+
+        pos = f"{self.image_idx + 1}/{len(self.image_paths)}" \
+              if (self.image_paths and 0 <= self.image_idx < len(self.image_paths)) else "0/0"
+
+        self.lbl_counts.config(
+            text=f"File: {fname}\nImage: {pos}\nBoxes: {total} (Visible: {visible})"
+        )
+
 
     # ---------- interactions ----------
     def on_canvas_enter(self, _event=None):
@@ -1839,8 +2637,26 @@ class LabelerApp(tk.Tk):
     def on_shift_down(self, _event=None): self.shift_held = True
     def on_shift_up(self, _event=None):   self.shift_held = False
 
-    def on_alt_down(self, _event=None): self.alt_held = True
-    def on_alt_up(self, _event=None):   self.alt_held = False
+    def on_alt_down(self, _event=None):
+         self.alt_held = True
+         try:
+             self.canvas.configure(cursor="none")
+             self.cursor_hidden = True
+             self._draw_cursor_plus()
+         except Exception:
+             pass
+         return "break"
+     
+    def on_alt_up(self, _event=None):
+         self.alt_held = False
+         try:
+             self.canvas.configure(cursor="none")
+             self.cursor_hidden = True
+             self._draw_cursor_plus()
+         except Exception:
+             pass
+         return "break"
+
 
     def _on_number_hotkey(self, digit:int):
         if not self.classes:
@@ -1862,18 +2678,21 @@ class LabelerApp(tk.Tk):
         self._draw_cursor_plus()
         if self.crosshair_on.get(): self._draw_crosshair()
 
-        # Ctrl+Drag -> pan
-        if self.control_held:
+        handle_hit = self._handle_hit_at_canvas(event.x, event.y)
+        imgx, imgy = self.canvas_to_img(event.x, event.y)
+        hit = self._hit_test_visible(imgx, imgy)
+
+        if self.control_held and (handle_hit is None) and (hit is None):
             self.panning = True
             self.pan_start_canvas = (event.x, event.y)
             self.pan_start_offset = (self.offset_x, self.offset_y)
             return
 
-        handle_hit = self._handle_hit_at_canvas(event.x, event.y)
         if handle_hit is not None:
             idx, hname = handle_hit
             self._start_resize(idx, hname, event)
             return
+
 
         imgx, imgy = self.canvas_to_img(event.x, event.y)
         hit = self._hit_test_visible(imgx, imgy)
@@ -1883,16 +2702,13 @@ class LabelerApp(tk.Tk):
                 for b in self.boxes:
                     b.selected = False
                 self.redraw() 
-        # --- SHIFT logic: additive selection or marquee selection
         if self.shift_held:
             if hit is not None:
-                # Additive select (don't toggle off)
                 if not self.boxes[hit].selected:
                     self.boxes[hit].selected = True
                     self._set_status("Added to selection.")
                     self.redraw()
                 else:
-                    # Already selected: start group move immediately
                     self._push_undo()
                     self.moving = True
                     self.move_start_img = (imgx, imgy)
@@ -1910,7 +2726,6 @@ class LabelerApp(tk.Tk):
 
         # --- no SHIFT
         if hit is not None:
-            # Start move: select clicked if it wasn't selected; else move all selected
             self._push_undo()
             if not self.boxes[hit].selected:
                 for b in self.boxes: b.selected = False
@@ -1950,7 +2765,7 @@ class LabelerApp(tk.Tk):
 
         if self.resizing and self.resize_idx is not None:
             imgx, imgy = self.canvas_to_img(event.x, event.y)
-            self._apply_resize(self.resize_idx, self.resize_handle, imgx, imgy)
+            self._apply_resize(self.resize_idx, self.resize_handle, imgx, imgy, alt=self._alt_active(event))
             self._remember_current()
             self.redraw()
             return
@@ -1960,25 +2775,68 @@ class LabelerApp(tk.Tk):
             self._update_marquee(event)
             return
 
-        # Group moving
         if self.moving and self.move_selected_indices:
             sx, sy = self.move_start_img
             imgx, imgy = self.canvas_to_img(event.x, event.y)
             dx, dy = imgx - sx, imgy - sy
+
+            # Compute group bbox at proposed position
+            gx1 = min(self.move_start_boxes[i][0] for i in self.move_selected_indices) + dx
+            gy1 = min(self.move_start_boxes[i][1] for i in self.move_selected_indices) + dy
+            gx2 = max(self.move_start_boxes[i][2] for i in self.move_selected_indices) + dx
+            gy2 = max(self.move_start_boxes[i][3] for i in self.move_selected_indices) + dy
+
+            add_dx_img = add_dy_img = 0
+            self._clear_snap_hints()
+
+            if self.control_held:
+                # Snap group edges in canvas space
+                x1c, y1c = self.img_to_canvas(int(gx1), int(gy1))
+                x2c, y2c = self.img_to_canvas(int(gx2), int(gy2))
+                xs, ys = self._build_snap_targets_canvas(skip_indices=set(self.move_selected_indices))
+
+                # pick nearer vertical edge
+                v_candidates = [(x1c, "left"), (x2c, "right")]
+                x_edge_c, _which = min(v_candidates, key=lambda t: min((abs(t[0]-c) for c in xs), default=1e9))
+                nx, x_on = self._snap_scalar(x_edge_c, xs)
+
+                # pick nearer horizontal edge
+                h_candidates = [(y1c, "top"), (y2c, "bottom")]
+                y_edge_c, _w = min(h_candidates, key=lambda t: min((abs(t[0]-c) for c in ys), default=1e9))
+                ny, y_on = self._snap_scalar(y_edge_c, ys)
+
+                if x_on:
+                    self._draw_snap_hints(nx, None)
+                    # convert delta canvas -> image delta
+                    dxc = nx - x_edge_c
+                    add_dx_img = int(round(dxc / self.scale))
+                if y_on:
+                    self._draw_snap_hints(None, ny)
+                    dyc = ny - y_edge_c
+                    add_dy_img = int(round(dyc / self.scale))
+
+            # Apply movement + snap delta
+            dx += add_dx_img
+            dy += add_dy_img
+
             for i in self.move_selected_indices:
                 b = self.boxes[i]
                 x1, y1, x2, y2 = self.move_start_boxes[i]
                 b.x1, b.y1, b.x2, b.y2 = x1, y1, x2, y2
                 b.move_by(dx, dy, self.image.size)
+
             self._remember_current()
             self.redraw()
             return
+
 
         # Annotation rubber band
         if self.dragging:
             self._update_rubber(event)
 
     def on_release(self, event):
+        self._clear_snap_hints()
+
         if self.image is None: return
         self.mouse_canvas_xy = (event.x, event.y)
         self._draw_cursor_plus()
@@ -2005,7 +2863,6 @@ class LabelerApp(tk.Tk):
             x1, y1, x2, y2 = self._norm_rect(sx, sy, ex, ey)
             selected_now = 0
             for b in self.boxes:
-                # Only consider visible boxes for hit-testing
                 if b.cls in self.classes and not self.classes[b.cls]["show"].get():
                     continue
                 if self._rects_intersect((b.x1, b.y1, b.x2, b.y2), (x1, y1, x2, y2)):
@@ -2030,7 +2887,7 @@ class LabelerApp(tk.Tk):
             self.dragging = False
             sx, sy = self.drag_start
             ex, ey = self.canvas_to_img(event.x, event.y)
-            if self.alt_held:
+            if self._alt_active(event):
                 dx, dy = ex - sx, ey - sy
                 side = min(abs(dx), abs(dy))
                 ex = sx + side * (1 if dx >= 0 else -1)
@@ -2054,6 +2911,8 @@ class LabelerApp(tk.Tk):
             if nb.size_ok():
                 self._push_undo()
                 self.boxes.append(nb)
+                nm = self.classes[cls_selected]["name"]
+                self._set_status(f'Added box as {nm} ({cls_selected}).')
                 self._remember_current()
             if self.rubber_id is not None:
                 self.canvas.delete(self.rubber_id); self.rubber_id = None
@@ -2066,7 +2925,7 @@ class LabelerApp(tk.Tk):
             self._draw_crosshair()
 
     def _start_resize(self, idx:int, handle:str, _event):
-        self._push_undo()  # snapshot before resize
+        self._push_undo()  
         self.select_box(idx)
         self.resizing = True
         self.resize_idx = idx
@@ -2078,16 +2937,34 @@ class LabelerApp(tk.Tk):
         if self.image is None: return
         if self.rubber_id is not None:
             self.canvas.delete(self.rubber_id); self.rubber_id = None
+    
         sx, sy = self.img_to_canvas(*self.drag_start)
         cx, cy = event.x, event.y
+    
+        x_snap_hint = y_snap_hint = None
+        if self.control_held:
+            xs, ys = self._build_snap_targets_canvas(skip_indices=None)
+            nx, sx_on = self._snap_scalar(cx, xs)
+            ny, sy_on = self._snap_scalar(cy, ys)
+            if sx_on: x_snap_hint = nx; cx = nx
+            if sy_on: y_snap_hint = ny; cy = ny
+            self._clear_snap_hints()
+            self._draw_snap_hints(x_snap_hint, y_snap_hint)
+        else:
+            self._clear_snap_hints()
+    
         if self.alt_held:
             dx, dy = cx - sx, cy - sy
             side = min(abs(dx), abs(dy))
             cx = sx + side * (1 if dx >= 0 else -1)
             cy = sy + side * (1 if dy >= 0 else -1)
-        self.rubber_id = self.canvas.create_rectangle(sx, sy, cx, cy, outline=PALETTE["warning"], width=2, dash=(3,2), tags=("overlay",))
+    
+        self.rubber_id = self.canvas.create_rectangle(
+            sx, sy, cx, cy, outline=PALETTE["warning"], width=2, dash=(3,2), tags=("overlay",)
+        )
         self._draw_crosshair()
         self._draw_cursor_plus()
+    
 
     def _hit_test_visible(self, imgx:int, imgy:int)->Optional[int]:
         for i in range(len(self.boxes)-1, -1, -1):
@@ -2099,7 +2976,6 @@ class LabelerApp(tk.Tk):
         return None
 
     def _handle_hit_at_canvas(self, cx:int, cy:int) -> Optional[Tuple[int,str]]:
-        # Only allow handle hit-testing when exactly one box is selected
         if sum(1 for b in self.boxes if b.selected) != 1:
             return None
 
@@ -2122,7 +2998,7 @@ class LabelerApp(tk.Tk):
                 return (sel, name)
         return None
 
-    def _apply_resize(self, idx:int, handle:str, imgx:int, imgy:int):
+    def _apply_resize(self, idx:int, handle:str, imgx:int, imgy:int, alt: bool = False):
         if self.image is None or self.resize_start_box is None: return
         b = self.boxes[idx]
         iw, ih = self.image.size
@@ -2137,13 +3013,13 @@ class LabelerApp(tk.Tk):
         def clamp_min_h_top(ny1):   return min(max(ny1, 0), y2 - MIN_SIDE)
         def clamp_min_h_bot(ny2):   return max(min(ny2, ih-1), y1 + MIN_SIDE)
 
-        if handle in ("n","s","w","e") and not self.alt_held:
+        if handle in ("n","s","w","e") and not alt:
             if handle == "n": y1 = clamp_min_h_top(ty)
             elif handle == "s": y2 = clamp_min_h_bot(ty)
             elif handle == "w": x1 = clamp_min_w_left(tx)
             elif handle == "e": x2 = clamp_min_w_right(tx)
         else:
-            if handle in ("nw","ne","sw","se") and self.alt_held:
+            if handle in ("nw","ne","sw","se") and alt:
                 if handle == "nw": ax, ay = sx2, sy2; sx = -1; sy = -1
                 elif handle == "ne": ax, ay = sx1, sy2; sx = +1; sy = -1
                 elif handle == "sw": ax, ay = sx2, sy1; sx = -1; sy = +1
@@ -2173,25 +3049,331 @@ class LabelerApp(tk.Tk):
                     elif handle == "e": x2 = clamp_min_w_right(tx)
 
         b.x1, b.y1, b.x2, b.y2 = int(x1), int(y1), int(x2), int(y2)
+        if self.control_held:
+            # Determine which edges are moving for this handle
+            move_left  = handle in ("w","nw","sw")
+            move_right = handle in ("e","ne","se")
+            move_top   = handle in ("n","nw","ne")
+            move_bot   = handle in ("s","sw","se")
+
+            xs, ys = self._build_snap_targets_canvas(skip_indices={idx})
+            self._clear_snap_hints()
+            x_hint = y_hint = None
+
+            if move_left or move_right:
+                x_left_c, _ = self.img_to_canvas(int(x1), int(y1))
+                x_right_c,_ = self.img_to_canvas(int(x2), int(y2))
+                if move_left:
+                    nx, on = self._snap_scalar(x_left_c, xs); 
+                    if on:
+                        x_hint = nx
+                        # convert back to image space
+                        xi,_ = self.canvas_to_img(nx, 0, clamp_inside=False)
+                        x1 = min(xi, x2 - MIN_SIDE)
+                if move_right:
+                    nx, on = self._snap_scalar(x_right_c, xs);
+                    if on:
+                        x_hint = nx
+                        xi,_ = self.canvas_to_img(nx, 0, clamp_inside=False)
+                        x2 = max(xi, x1 + MIN_SIDE)
+
+            if move_top or move_bot:
+                _, y_top_c  = self.img_to_canvas(int(x1), int(y1))
+                _, y_bot_c  = self.img_to_canvas(int(x2), int(y2))
+                if move_top:
+                    ny, on = self._snap_scalar(y_top_c, ys);
+                    if on:
+                        y_hint = ny
+                        _, yi = self.canvas_to_img(0, ny, clamp_inside=False)
+                        y1 = min(yi, y2 - MIN_SIDE)
+                if move_bot:
+                    ny, on = self._snap_scalar(y_bot_c, ys);
+                    if on:
+                        y_hint = ny
+                        _, yi = self.canvas_to_img(0, ny, clamp_inside=False)
+                        y2 = max(yi, y1 + MIN_SIDE)
+
+            self._draw_snap_hints(x_hint, y_hint)
 
     # ---------- utility ----------
     def select_box(self, idx:int):
-        # single selection helper (used on direct clicks)
         for i,b in enumerate(self.boxes):
             b.selected = (i==idx)
         self.redraw()
+    def _open_quick_class_search(self, x_root: int, y_root: int, selected_count: int = 0):
+        if not self.classes:
+            try:
+                self._set_status("No labels to search.")
+                messagebox.showinfo("Quick search", "No labels yet. Add a label or run YOLO prefill.")
+            except Exception:
+                pass
+            return
+
+        # Close existing popover
+        if hasattr(self, "_qs_win") and self._qs_win is not None:
+            try: self._qs_win.destroy()
+            except Exception: pass
+            self._qs_win = None
+    
+        win = tk.Toplevel(self)
+        self._qs_win = win
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=PALETTE["card"])
+    
+        outer = ttk.Frame(win, style="Dialog.TFrame", padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+    
+        # --- Quick Label row (only if something is selected) ----------------------
+        active_cid = self.var_new_cls.get()
+        active_name = self.classes.get(active_cid, {}).get("name", f"class_{active_cid}")
+    
+        def do_quick_label():
+            if selected_count > 0:
+                self.set_selected_class(active_cid)
+            try:
+                win.destroy()
+            finally:
+                self._qs_win = None
+        def on_tab(e):
+            return on_enter(e)
+
+        if selected_count > 0:
+            top = ttk.Frame(outer, style="Dialog.TFrame")
+            top.pack(fill=tk.X, pady=(0, 6))
+            btn = ttk.Button(
+                top,
+                text=f"💡 Label {selected_count} as {active_name} ({active_cid})",
+                style="Accent.TButton",
+                command=do_quick_label,
+            )
+            btn.pack(fill=tk.X)
+    
+        # --- Search entry + results ----------------------------------------------
+        self._qs_query = tk.StringVar()
+        ent = ttk.Entry(outer, textvariable=self._qs_query)
+        ent.pack(fill=tk.X)
+        ent.focus_set()
+
+        lb = tk.Listbox(outer, activestyle="none", highlightthickness=0, bd=0)
+        lb.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        self._qs_listbox = lb
+        self._qs_results = []
+
+        def refresh_list(preserve=False):
+            """Rebuild list items; optionally keep the previous selection index."""
+            prev_idx = None
+            if preserve:
+                try:
+                    sel = lb.curselection()
+                    if sel:
+                        prev_idx = sel[0]
+                except Exception:
+                    prev_idx = None
+
+            q = (self._qs_query.get() or "").strip().lower()
+            items = self._quick_class_results(q)
+            self._qs_results = items
+
+            lb.delete(0, tk.END)
+            for _cid, name in items:
+                lb.insert(tk.END, name)
+            lb.configure(height=min(max(4, len(items)), 10))
+
+            if items:
+                idx = prev_idx if (prev_idx is not None and 0 <= prev_idx < len(items)) else 0
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(idx)
+                lb.activate(idx)
+                lb.see(idx)
+
+        def _on_qs_text_change(*_):
+            refresh_list(preserve=True)
+
+        self._qs_trace_id = self._qs_query.trace_add("write", _on_qs_text_change)
+
+        def _cleanup_qs_trace():
+            try:
+                if getattr(self, "_qs_trace_id", None):
+                    self._qs_query.trace_remove("write", self._qs_trace_id)
+                    self._qs_trace_id = None
+            except Exception:
+                pass
+            
+        def apply_current():
+            if not self._qs_results:
+                return
+            try:
+                sel = lb.curselection()
+                idx = sel[0] if sel else 0
+            except Exception:
+                idx = 0
+            cid, _name = self._qs_results[idx]
+            self._apply_quick_class_choice(cid)
+            _cleanup_qs_trace()
+            try:
+                win.destroy()
+            finally:
+                self._qs_win = None
+
+        def on_key_nav(e):
+            if not self._qs_results:
+                return "break"
+            try:
+                sel = lb.curselection()
+                cur = sel[0] if sel else 0
+            except Exception:
+                cur = 0
+            if e.keysym == "Down":
+                nxt = min(cur + 1, max(0, len(self._qs_results) - 1))
+            else:
+                nxt = max(cur - 1, 0)
+            lb.selection_clear(0, tk.END)
+            lb.selection_set(nxt)
+            lb.activate(nxt)
+            lb.see(nxt)
+            lb.focus_set()
+            return "break"
+
+        def on_enter(_e):
+            if self._qs_results:
+                apply_current()
+            else:
+                if selected_count > 0:
+                    do_quick_label()
+            return "break"
+
+        def on_escape(_e):
+            _cleanup_qs_trace()
+            try:
+                win.destroy()
+            finally:
+                self._qs_win = None
+            return "break"
+
+        def on_click(_e):
+            apply_current()
+
+        def _is_within_popover(widget):
+            while widget is not None:
+                if widget == win:
+                    return True
+                widget = getattr(widget, "master", None)
+            return False
+
+        def _close_popover():
+            _cleanup_qs_trace()
+            try:
+                win.destroy()
+            finally:
+                self._qs_win = None
+
+        def _deferred_focus_check():
+            tgt = win.focus_get()
+            if tgt is None:
+                win.after(10, _deferred_focus_check)
+                return
+            if not _is_within_popover(tgt):
+                _close_popover()
+
+        def on_focus_event(_e=None):
+            win.after(0, _deferred_focus_check)
+
+
+        # Bindings (note: no <KeyRelease> on the Entry anymore)
+        ent.bind("<Return>", on_enter)
+        ent.bind("<Escape>", on_escape)
+        ent.bind("<Down>", on_key_nav)
+        ent.bind("<Up>", on_key_nav)
+        ent.bind("<Tab>", on_tab)
+
+        lb.bind("<Double-Button-1>", on_click)
+        lb.bind("<Return>", on_enter)
+        lb.bind("<Escape>", on_escape)
+        lb.bind("<Down>", on_key_nav)
+        lb.bind("<Up>", on_key_nav)
+        lb.bind("<Tab>", on_tab)
+
+        win.bind("<FocusOut>", on_focus_event)
+        win.bind("<Unmap>", lambda e: _close_popover())
+
+        # Position popover near cursor
+        win.update_idletasks()
+        W = max(260, outer.winfo_reqwidth())
+        H = max(160, outer.winfo_reqheight())
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = min(max(0, x_root + 8), sw - W - 2)
+        y = min(max(0, y_root + 8), sh - H - 2)
+        win.geometry(f"{W}x{H}+{x}+{y}")
+
+        # Initial population
+        refresh_list(preserve=False)
+
+    
+
+    def _quick_class_results(self, query: str):
+        """
+        Return list[(cid, name)] filtered by query.
+        Rank: prefix matches first, then substring matches, then by name.
+        """
+        q = query.lower()
+        items = []
+        for cid, info in self.classes.items():
+            name = str(info.get("name", f"class_{cid}"))
+            nlow = name.lower()
+            if not q:
+                score = (1, 9999, nlow)     # neutral
+                items.append((score, cid, name))
+                continue
+            pos = nlow.find(q)
+            if pos == -1:
+                continue
+            score = (0 if pos == 0 else 1, pos, nlow)
+            items.append((score, cid, name))
+        items.sort(key=lambda t: t[0])
+        return [(cid, name) for _score, cid, name in items]
+
+    def _apply_quick_class_choice(self, cid: int):
+        """
+        If any boxes are selected -> set their class.
+        Else -> set active class (radio selection).
+        """
+        has_sel = any(b.selected for b in self.boxes)
+        self.var_new_cls.set(cid)
+        if has_sel:
+            self.set_selected_class(cid)
+        else:
+            if cid in self.classes:
+                self.var_new_cls.set(cid)
+                self._set_status(f'Active class set to {self.classes[cid]["name"]} ({cid})')
+                self.redraw()
 
     def on_right_click(self, event):
-        if self.image is None or self.ctx is None: return
+        if self.image is None:
+            return
+
         imgx, imgy = self.canvas_to_img(event.x, event.y)
         hit = self._hit_test_visible(imgx, imgy)
-        if hit is not None:
-            for i,b in enumerate(self.boxes):
-                b.selected = (i==hit)
+
+        # Ctrl: force legacy menu
+        if self.control_held and self.ctx is not None:
             try:
                 self.ctx.tk_popup(event.x_root, event.y_root)
             finally:
                 self.ctx.grab_release()
+            return
+
+        # If nothing selected and we right-click on a box, select just that box
+        if not any(b.selected for b in self.boxes) and hit is not None:
+            for i, b in enumerate(self.boxes):
+                b.selected = (i == hit)
+            self.redraw()
+
+        sel_count = sum(1 for b in self.boxes if b.selected)
+        self._open_quick_class_search(event.x_root, event.y_root, selected_count=sel_count)
+
+
+    
 
     def on_delete_selected(self, event=None):
         sel_count = sum(1 for b in self.boxes if b.selected)
@@ -2216,7 +3398,7 @@ class LabelerApp(tk.Tk):
             "Clear all boxes?",
             msg,
             buttons=[
-                ("Delete boxes", "Danger.TButton", "delete"),  # primary (Enter)
+                ("Delete boxes", "Danger.TButton", "delete"),  
                 ("Keep boxes",   "TButton",         "keep"),
                 ("Cancel",       "TButton",          None),
             ],
@@ -2236,32 +3418,50 @@ class LabelerApp(tk.Tk):
 
 
 
-    def set_selected_class(self, cls_id:int):
+    def set_selected_class(self, cls_id: int):
         if cls_id not in self.classes:
             messagebox.showwarning("Unknown class", f"Class id {cls_id} does not exist.")
             return
-        changed = False
-        for b in self.boxes:
-            if b.selected and b.cls != cls_id:
-                if not changed: self._push_undo()
-                b.cls = cls_id; changed = True
-        if changed:
-            self._remember_current()
-            self._set_status(f"Changed selected box to class {cls_id} ({self.classes[cls_id]['name']}).")
-            self.redraw()
+
+        # Boxes that actually need relabeling
+        to_change = [b for b in self.boxes if b.selected and b.cls != cls_id]
+        if not to_change:
+            # Either no selection, or already that class
+            if any(b.selected for b in self.boxes):
+                self._set_status("No change: selected boxes already labeled.")
+            else:
+                self._set_status("No selection to label.")
+            return
+
+        self._push_undo()
+        for b in to_change:
+            b.cls = cls_id
+        self._remember_current()
+        self._set_status(
+            f'Labeled {len(to_change)} box(es) as {self.classes[cls_id]["name"]} ({cls_id}).'
+        )
+        self.redraw()
+
 
     def nudge_selected(self, dx:int, dy:int):
         if self.image is None: return
         sel_idxs = [i for i, b in enumerate(self.boxes) if b.selected]
         if not sel_idxs:
             return
+    
+        # Move faster while Ctrl is held
+        step = FAST_NUDGE if self.control_held else 1
+        dx *= step
+        dy *= step
+    
         self._push_undo()
         for i in sel_idxs:
             self.boxes[i].move_by(dx, dy, self.image.size)
         self._remember_current()
         self.redraw()
+    
 
-    # ---- copy / paste (group-aware) ----
+    # ---- copy / paste ----
     def copy_selected(self):
         sel_idxs = [i for i, b in enumerate(self.boxes) if b.selected]
         if not sel_idxs:
@@ -2269,7 +3469,7 @@ class LabelerApp(tk.Tk):
             return
         self.copied_box = [(self.boxes[i].x1, self.boxes[i].y1, self.boxes[i].x2, self.boxes[i].y2, self.boxes[i].cls)
                            for i in sel_idxs]
-        self.paste_count = 0  # reset so the NEXT paste gets an offset
+        self.paste_count = 0  
         self._set_status(f"Copied {len(sel_idxs)} box(es).")
 
     def paste_copied(self):
@@ -2325,7 +3525,7 @@ class LabelerApp(tk.Tk):
         src_path = self.image_paths[self.image_idx]
     
         try:
-            # Write YOLO labels only (no image duplication)
+            # Write YOLO labels only
             self._write_yolo_txt_for_path(src_path, self.boxes)
         except Exception as ex:
             if not silent:
@@ -2343,8 +3543,11 @@ class LabelerApp(tk.Tk):
         return True
     
     def on_save(self):
-        self._do_save(silent=False)
-
+        ok = self._do_save(silent=False)
+        self.control_held = False
+        self.panning = False
+        self.canvas.focus_set()
+        return ok
 # ---------- main ----------
 if __name__ == "__main__":
     app = LabelerApp()
